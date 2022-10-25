@@ -2,7 +2,7 @@
 # Copyright (c) 2017-2022 VMware, Inc. or its affiliates
 # SPDX-License-Identifier: Apache-2.0
 
-set -eu -o pipefail -o errtrace
+set -exu -o pipefail -o errtrace
 
 RPM=$1
 RELEASE=$2
