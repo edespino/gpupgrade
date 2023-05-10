@@ -1,0 +1,329 @@
+{{range .UpgradeJobs}}
+  {{- if .FunctionalTest}}
+  - name: generate-cluster
+    # Specifying serial groups so that only one platform runs at a time. For
+    # example, 5-to-6-centos7 will only run after 5-to-6-centos6 completes. This
+    # will prevent concourse from becoming overloaded.
+    plan:
+      - in_parallel:
+          - get: enterprise_rpm
+            trigger: true
+            passed: [ build ]
+          - get: gpupgrade_src
+            passed: [ build ]
+          - get: rpm_gpdb_source
+            resource: gpdb{{.Source}}_{{.OSVersion}}_rpm
+            trigger: true
+          {{- if ne .Source .Target }}
+          - get: rpm_gpdb_target
+            resource: gpdb{{.Target}}_{{.OSVersion}}_rpm
+            trigger: true
+          {{- end }}
+          - get: ccp_src
+          - get: terraform.d
+            params:
+              unpack: true
+      - put: terraform
+        params:
+          <<: *ccp_default_params
+          vars:
+            {{- if .PrimariesOnly}}
+            mirrors: false
+            {{- else if not .NoStandby}}
+            standby_coordinator: true
+            {{- end}}
+            instance_type: n1-standard-2
+            number_of_nodes: 4
+            PLATFORM: {{.OSVersion}}
+            # Decrease the reap time from the default of 8 hours now that there are
+            # both centos6 and centos7 jobs in order to not overload concourse.
+            ccp_reap_minutes: 180
+      - task: gen_source_cluster
+        file: ccp_src/ci/tasks/gen_cluster.yml
+        params:
+          <<: *ccp_gen_cluster_default_params
+          PLATFORM: {{.OSVersion}}
+          GPDB_RPM: true
+        input_mapping:
+          gpdb_rpm: rpm_gpdb_source
+      - task: gpinitsystem_source_cluster
+        file: ccp_src/ci/tasks/gpinitsystem.yml
+      - task: prepare_installation
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: registry.access.redhat.com/ubi8/ubi
+              tag: latest
+          inputs:
+            - name: gpupgrade_src
+            - name: cluster_env_files
+            - name: enterprise_rpm
+            {{- if ne .Source .Target }}
+            - name: rpm_gpdb_target
+            {{- end }}
+
+          run:
+            path: gpupgrade_src/ci/scripts/prepare-installation.bash
+            args:
+              - greenplum-db-{{majorVersion .Source}}
+              - greenplum-db-{{majorVersion .Target}}
+      - task: save_cluster_env_files
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: gcr.io/data-gpdb-public-images/gpdb6-centos7-test-golang
+              tag: latest
+          inputs:
+            - name: gpupgrade_src
+            - name: ccp_src
+            - name: cluster_env_files
+          outputs:
+            - name: tared_cluster_env_files
+          run:
+            path: bash
+            args:
+              - -c
+              - |
+                set -eux -o pipefail
+                
+                tar -czvf cluster_env_files.tar.gz cluster_env_files/
+                mv cluster_env_files.tar.gz tared_cluster_env_files/
+      - put: saved_cluster_env_files
+        params:
+          file: tared_cluster_env_files/*.tar.gz
+    ensure:
+      <<: *set_failed
+    on_success:
+      <<: *ccp_destroy
+    on_failure:
+      <<: *slack_alert
+  {{- end }}
+{{end -}}
+
+{{range .UpgradeJobs}}
+  {{- if .FunctionalTest}}
+  - name: load-schema
+    # Specifying serial groups so that only one platform runs at a time. For
+    # example, 5-to-6-centos7 will only run after 5-to-6-centos6 completes. This
+    # will prevent concourse from becoming overloaded.
+    plan:
+      - in_parallel:
+          - get: gpupgrade_src
+            trigger: true
+          - get: saved_cluster_env_files
+            trigger: true
+            passed: [ generate-cluster ]
+          - get: schema_dump
+            trigger: true
+      - task: load_schema
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: gcr.io/data-gpdb-public-images/gpdb6-centos7-test-golang
+              tag: latest
+          inputs:
+            - name: gpupgrade_src
+            - name: schema_dump
+            - name: saved_cluster_env_files
+          run:
+            path: gpupgrade_src/test/functional/scripts/load-schema.bash
+    ensure:
+      <<: *set_failed
+    on_success:
+      <<: *ccp_destroy
+    on_failure:
+      <<: *slack_alert
+  {{- end }}
+{{end -}}
+  
+{{range .UpgradeJobs}}
+  {{- if .FunctionalTest}}
+  - name: initialize-data-migration-scripts
+    # Specifying serial groups so that only one platform runs at a time. For
+    # example, 5-to-6-centos7 will only run after 5-to-6-centos6 completes. This
+    # will prevent concourse from becoming overloaded.
+    plan:
+      - in_parallel:
+          - get: gpupgrade_src
+            trigger: true
+            passed: [ load-schema ]
+          - get: saved_cluster_env_files
+            trigger: true
+            passed: [ generate-cluster ]
+      - task: apply_data_migration_scripts
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: gcr.io/data-gpdb-public-images/gpdb6-centos7-test-golang
+              tag: latest
+          inputs:
+            - name: gpupgrade_src
+            - name: saved_cluster_env_files
+          run:
+            path: bash
+            args:
+              - -c
+              - |
+                set -eux -o pipefail
+
+                echo "Enabling ssh to the ccp cluster..."
+                tar -xzvf saved_cluster_env_files/cluster_env_files.tar.gz
+                cp -R cluster_env_files/.ssh /root/.ssh
+
+                source gpupgrade_src/test/functional/scripts/environment.bash
+
+                echo "Running the data migration scripts on the source cluster..."
+                time ssh -n cdw "
+                    set -eux -o pipefail
+                    
+                    source /usr/local/greenplum-db-source/greenplum_path.sh
+                    
+                    gpupgrade generate --non-interactive --gphome "$GPHOME_SOURCE" --port "$PGPORT" --output-dir /home/gpadmin/gpupgrade
+                    gpupgrade apply    --non-interactive --gphome "$GPHOME_SOURCE" --port "$PGPORT" --input-dir /home/gpadmin/gpupgrade --phase stats
+                    gpupgrade apply    --non-interactive --gphome "$GPHOME_SOURCE" --port "$PGPORT" --input-dir /home/gpadmin/gpupgrade --phase initialize
+                "
+    ensure:
+      <<: *set_failed
+    on_success:
+      <<: *ccp_destroy
+    on_failure:
+      <<: *slack_alert
+  {{- end }}
+{{end -}}
+
+{{range .UpgradeJobs}}
+  {{- if .FunctionalTest}}
+  - name: run-initialize
+    # Specifying serial groups so that only one platform runs at a time. For
+    # example, 5-to-6-centos7 will only run after 5-to-6-centos6 completes. This
+    # will prevent concourse from becoming overloaded.
+    plan:
+      - in_parallel:
+          - get: gpupgrade_src
+            trigger: true
+            passed: [ initialize-data-migration-scripts ]
+          - get: saved_cluster_env_files
+            trigger: true
+            passed: [ generate-cluster ]
+      - task: run_initialize
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: gcr.io/data-gpdb-public-images/gpdb6-centos7-test-golang
+              tag: latest
+          inputs:
+            - name: gpupgrade_src
+            - name: saved_cluster_env_files
+          run:
+            path: gpupgrade_src/test/functional/scripts/run-initialize.bash
+    ensure:
+      <<: *set_failed
+    on_success:
+      <<: *ccp_destroy
+    on_failure:
+      <<: *slack_alert
+  {{- end }}
+{{end -}}
+
+{{range .UpgradeJobs}}
+  {{- if .FunctionalTest}}
+  - name: upgrade-cluster
+    # Specifying serial groups so that only one platform runs at a time. For
+    # example, 5-to-6-centos7 will only run after 5-to-6-centos6 completes. This
+    # will prevent concourse from becoming overloaded.
+    plan:
+      - in_parallel:
+          - get: gpupgrade_src
+            trigger: true
+            passed: [ run-initialize ]
+          - get: saved_cluster_env_files
+            trigger: true
+            passed: [ generate-cluster ]
+      - task: upgrade_cluster
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: gcr.io/data-gpdb-public-images/gpdb6-centos7-test-golang
+              tag: latest
+          inputs:
+            - name: gpupgrade_src
+            - name: saved_cluster_env_files
+          run:
+            path: gpupgrade_src/test/functional/scripts/upgrade-functional-cluster.bash
+        params:
+          FILTER_DIFF: 0
+          MODE: {{ .Mode }}
+    ensure:
+      <<: *set_failed
+    on_success:
+      <<: *ccp_destroy
+    on_failure:
+      <<: *slack_alert
+  {{- end }}
+{{end -}}
+
+{{range .UpgradeJobs}}
+  {{- if .FunctionalTest}}
+  {{- if not .NoStandby -}}
+  {{- if not .PrimariesOnly }}
+  - name: validate-mirrors-and-standby
+    # Specifying serial groups so that only one platform runs at a time. For
+    # example, 5-to-6-centos7 will only run after 5-to-6-centos6 completes. This
+    # will prevent concourse from becoming overloaded.
+    plan:
+      - in_parallel:
+          - get: gpupgrade_src
+            trigger: true
+            passed: [ upgrade-cluster ]
+          - get: saved_cluster_env_files
+            trigger: true
+            passed: [ generate-cluster ]
+      - task: validate_mirrors_and_standby
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: gcr.io/data-gpdb-public-images/gpdb6-centos7-test-golang
+              tag: latest
+          inputs:
+            - name: gpupgrade_src
+            - name: saved_cluster_env_files
+          run:
+            path: bash
+            args:
+              - -c
+              - |
+                set -eux -o pipefail
+
+                echo "Enabling ssh to the ccp cluster..."
+                tar -xzvf saved_cluster_env_files/cluster_env_files.tar.gz
+                cp -R cluster_env_files/.ssh /root/.ssh
+
+                # Load the finalize test library.
+                source gpupgrade_src/test/acceptance/helpers/finalize_checks.bash
+                
+                echo 'Doing failover tests of mirrors and standby...'
+                validate_mirrors_and_standby /usr/local/greenplum-db-target cdw 5432
+    ensure:
+      <<: *set_failed
+    on_success:
+      <<: *ccp_destroy
+    on_failure:
+      <<: *slack_alert
+  {{- end -}}
+  {{- end }}
+  {{- end }}
+{{end -}}

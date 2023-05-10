@@ -189,18 +189,18 @@ FLY_TARGET ?= cm
 # environment variable JOB_TYPE is used to determine whether a dev or prod
 # pipeline is generated. It is used when go generate runs our yaml parser.
 ifeq ($(FLY_TARGET),prod)
-set-pipeline: export JOB_TYPE=prod
+set-pipeline functional-pipeline: export JOB_TYPE=prod
 else
-set-pipeline: export JOB_TYPE=dev
+set-pipeline functional-pipeline: export JOB_TYPE=dev
 endif
 
-.PHONY: set-pipeline expose-pipeline
-set-pipeline: export 5X_GIT_USER=${5X_GIT_USER:-}
-set-pipeline: export 5X_GIT_BRANCH=${5X_GIT_BRANCH:-}
-set-pipeline: export 6X_GIT_USER=${6X_GIT_USER:-}
-set-pipeline: export 6X_GIT_BRANCH=${6X_GIT_BRANCH:-}
-set-pipeline: export 7X_GIT_USER=${7X_GIT_USER:-}
-set-pipeline: export 7X_GIT_BRANCH=${7X_GIT_BRANCH:-}
+.PHONY: set-pipeline functional-pipeline expose-pipeline
+set-pipeline functional-pipeline: export 5X_GIT_USER=${5X_GIT_USER:-}
+set-pipeline functional-pipeline: export 5X_GIT_BRANCH=${5X_GIT_BRANCH:-}
+set-pipeline functional-pipeline: export 6X_GIT_USER=${6X_GIT_USER:-}
+set-pipeline functional-pipeline: export 6X_GIT_BRANCH=${6X_GIT_BRANCH:-}
+set-pipeline functional-pipeline: export 7X_GIT_USER=${7X_GIT_USER:-}
+set-pipeline functional-pipeline: export 7X_GIT_BRANCH=${7X_GIT_BRANCH:-}
 set-pipeline:
 	mkdir -p ci/generated
 	cat ci/1_resources_anchors_groups.yml \
@@ -215,6 +215,19 @@ set-pipeline:
 	#NOTE-- such as https://github.com/greenplum-db/gpupgrade.git"
 	fly -t $(FLY_TARGET) set-pipeline -p $(PIPELINE_NAME) \
 		-c ci/generated/pipeline.yml \
+		-v gpupgrade-git-remote=$(GIT_URI) \
+		-v gpupgrade-git-branch=$(BRANCH)
+
+functional-pipeline:
+	mkdir -p test/functional/generated
+	cat test/functional/1_resources_anchors_groups.yml \
+		test/functional/2_build.yml \
+		test/functional/3_generate_cluster_and_load_schema.yml > test/functional/generated/template.yml
+	go generate ./test/functional
+	#NOTE-- make sure your gpupgrade-git-remote uses an https style git"
+	#NOTE-- such as https://github.com/greenplum-db/gpupgrade.git"
+	fly -t $(FLY_TARGET) set-pipeline -p $(PIPELINE_NAME)-functional-test \
+		-c test/functional/generated/pipeline.yml \
 		-v gpupgrade-git-remote=$(GIT_URI) \
 		-v gpupgrade-git-branch=$(BRANCH)
 

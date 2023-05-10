@@ -3,5 +3,5 @@
 
 package ci
 
-// Generate the pipeline from template.yml using parse_template
+// Generate the pipeline from 1_resources_anchors_groups.yml using parse_template
 //go:generate go run ./parser generated/template.yml generated/pipeline.yml

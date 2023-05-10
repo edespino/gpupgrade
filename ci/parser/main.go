@@ -7,7 +7,7 @@ Given a list of source versions and target versions, it will render these
 versions into the places specified by the template.
 
 Usage:
-parse_template template.yml output.yml
+parse_template 1_resources_anchors_groups.yml output.yml
 
 Note: This will overwrite the contents of output.yml (if the file already
 exists) with the parsed output.
@@ -146,6 +146,7 @@ func init() {
 		{NoStandby: true},
 		{RetailDemo: true},
 		{TestExtensions: true},
+		{FunctionalTest: true},
 	}
 
 	// SpecialJobs cases for 5->6. (These are special-cased to avoid exploding the

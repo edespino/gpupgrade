@@ -1,0 +1,198 @@
+---
+# Copyright (c) 2017-2023 VMware, Inc. or its affiliates
+# SPDX-License-Identifier: Apache-2.0
+
+resource_types:
+  - name: gcs
+    type: registry-image
+    source:
+      repository: frodenas/gcs-resource
+
+  - name: slack-notification
+    type: registry-image
+    source:
+      repository: cfcommunity/slack-notification-resource
+      tag: latest
+
+  - name: terraform
+    type: registry-image
+    source:
+      repository: ljfranklin/terraform-resource
+      tag: 0.11.14
+
+resources:
+  - name: gpupgrade_src
+    type: git
+    source:
+      uri: ((gpupgrade-git-remote))
+      branch: ((gpupgrade-git-branch))
+      fetch_tags: true
+
+  - name: saved_cluster_env_files
+    type: gcs
+    source:
+      json_key: ((upgrade/cm-gcs-service-account-key))
+      bucket: gpupgrade-intermediates
+      versioned_file: functional-testing/cluster_env_files.tar.gz
+
+  - name: schema_dump
+    type: gcs
+    source:
+      json_key: ((upgrade/cm-gcs-service-account-key))
+      bucket: gpupgrade-intermediates
+      versioned_file: dump/5X/dump.sql.xz
+
+# gpupgrade tests with release candidates for the source and target version.
+# This allows for faster feedback for example when changes are made to
+# pg_upgrade. Specifically, the following scenario has occurred where a
+# pg_upgrade check was added requiring a function to be installed in both the
+# source and target clusters. In order to test this scenario release candidate
+# builds are needed.
+{{range .GPDBVersions}}
+  {{- if not (eq .OSVersion "centos6") }}
+  - name: gpdb{{.GPDBVersion}}_{{.OSVersion}}_rpm
+    type: gcs
+    source:
+      {{- if .TestRCIdentifier }}
+      # Test release candidate rpms built with --build-test-rc are published to the -dev bucket.
+      bucket: pivotal-gpdb-concourse-resources-dev
+      {{- else }}
+      # Test release candidate rpms built from production pipelines are published to the -prod bucket.
+      bucket: pivotal-gpdb-concourse-resources-prod
+      {{- end }}
+      json_key: ((concourse-gcs-resources-service-account-key))
+      regexp: server/published/gpdb{{ majorVersion .GPDBVersion }}/greenplum-db-{{.TestRCIdentifier}}({{escapeVersion .GPDBVersion}}.*)-rhel{{.OSVersionNumber}}-x86_64.debug.rpm
+  {{- end }}
+{{end}}
+
+  - name: oss_rpm
+    type: gcs
+    source:
+      bucket: gpupgrade-intermediates
+      json_key: ((upgrade/cm-gcs-service-account-key))
+      versioned_file: oss/gpupgrade-intermediate.el7.x86_64.rpm
+
+  - name: enterprise_rpm
+    type: gcs
+    source:
+      bucket: gpupgrade-intermediates
+      json_key: ((upgrade/cm-gcs-service-account-key))
+      versioned_file: enterprise/gpupgrade-intermediate.el7.x86_64.rpm
+
+  - name: slack-alert
+    type: slack-notification
+    source:
+      url: ((upgrade/{{.JobType}}/cm-slack-webhook-url))
+
+  - name: ccp_src
+    type: git
+    source:
+      branch: main
+      private_key: ((gp-concourse-cluster-provisioner-git-key))
+      uri: git@github.com:pivotal/gp-concourse-cluster-provisioner.git
+
+  - name: terraform
+    type: terraform
+    source:
+      env:
+        AWS_ACCESS_KEY_ID: ((tf-machine-access-key-id))
+        AWS_SECRET_ACCESS_KEY: ((tf-machine-secret-access-key))
+        GOOGLE_CREDENTIALS: ((upgrade/{{.JobType}}/google-service-account-key))
+      vars:
+        project_id: ((upgrade/{{.JobType}}/google-project-id))
+      storage:
+        access_key_id: ((tf-machine-access-key-id))
+        secret_access_key: ((tf-machine-secret-access-key))
+        region_name: us-west-2
+        # This is not parameterized, on purpose. All tfstates will go to this spot,
+        # and different teams will place there clusters' tfstate files under different paths
+        bucket: gpdb5-pipeline-dynamic-terraform
+        bucket_path: clusters-google/
+
+  - name: terraform.d
+    source:
+      access_key_id: ((aws-bucket-access-key-id))
+      secret_access_key: ((aws-bucket-secret-access-key))
+      region_name: us-west-2
+      bucket: ccp-terraform-provider-plugins
+      versioned_file: plugin-cache.tgz
+    type: s3
+
+anchors:
+  - &ccp_default_params
+    action: create
+    delete_on_failure: true
+    generate_random_name: true
+    plugin_dir: ../../terraform.d/plugin-cache/linux_amd64
+    terraform_source: ccp_src/google/
+
+  - &ccp_gen_cluster_default_params
+    AWS_ACCESS_KEY_ID: ((tf-machine-access-key-id))
+    AWS_SECRET_ACCESS_KEY: ((tf-machine-secret-access-key))
+    AWS_DEFAULT_REGION: us-west-2
+    BUCKET_PATH: clusters-google/
+    BUCKET_NAME: gpdb5-pipeline-dynamic-terraform
+    CLOUD_PROVIDER: google
+
+  - &ccp_destroy
+    put: terraform
+    params:
+      action: destroy
+      plugin_dir: ../../terraform.d/plugin-cache/linux_amd64
+      env_name_file: terraform/name
+      terraform_source: ccp_src/google/
+      vars:
+        aws_instance-node-instance_type: t2.micro #t2.micro is ignored in destroy, but aws_instance-node-instance_type is required.
+        aws_ebs_volume_type: standard
+    get_params:
+      action: destroy
+
+  - &set_failed
+    do:
+      - task: on_failure_set_failed
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: gcr.io/data-gpdb-public-images/ccp
+          inputs:
+            - name: ccp_src
+            - name: terraform
+          run:
+            path: ccp_src/google/ccp_failed_test.sh
+          params:
+            GOOGLE_CREDENTIALS: ((upgrade/{{.JobType}}/google-service-account-key))
+            GOOGLE_PROJECT_ID: ((upgrade/{{.JobType}}/google-project-id))
+            GOOGLE_ZONE: us-central1-a
+            AWS_ACCESS_KEY_ID: ((tf-machine-access-key-id))
+            AWS_SECRET_ACCESS_KEY: ((tf-machine-secret-access-key))
+            AWS_DEFAULT_REGION: us-west-2
+            BUCKET_PATH: clusters-google/
+            BUCKET_NAME: gpdb5-pipeline-dynamic-terraform
+
+  - &slack_alert
+    do:
+      - put: slack-alert
+        params:
+          text: |
+            Hey team, <$ATC_EXTERNAL_URL/teams/$BUILD_TEAM_NAME/pipelines/$BUILD_PIPELINE_NAME/jobs/$BUILD_JOB_NAME/builds/$BUILD_NAME|gpupgrade/$BUILD_JOB_NAME> failed.
+
+groups:
+  - name: all
+    jobs:
+      - build
+      {{- range .UpgradeJobs}}
+      {{- if .FunctionalTest}}
+      - generate-cluster
+      - load-schema
+      - run-initialize
+      - initialize-data-migration-scripts
+      - upgrade-cluster
+      {{- if not .NoStandby -}}
+      {{- if not .PrimariesOnly }}
+      - validate-mirrors-and-standby
+      {{- end -}}
+      {{- end }}
+      {{- end }}
+      {{- end }}
